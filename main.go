@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -16,29 +17,26 @@ import (
 type Backend struct {
 	URL        *url.URL
 	Weight     int
-	Current    int
-	FinishTime float64
-	ActiveConn int
+	Deficit    float64   // for DRR
+	FinishTime float64   // for WFQ
+	ActiveConn int       // for LC
 	Mutex      sync.Mutex
-}
-
-type BackendGroup struct {
-	Path     string
-	Backends []*Backend
 }
 
 type LoadBalancer struct {
 	Groups    map[string][]*Backend
 	Algorithm string
-	Quantum   int
+	Quantum   float64
 	mu        sync.Mutex
+	lastUsed  map[string]int // for DRR rotation
 }
 
-func NewLoadBalancer(algorithm string, quantum int) *LoadBalancer {
+func NewLoadBalancer(algorithm string, quantum float64) *LoadBalancer {
 	return &LoadBalancer{
 		Algorithm: algorithm,
 		Quantum:   quantum,
 		Groups:    make(map[string][]*Backend),
+		lastUsed:  make(map[string]int),
 	}
 }
 
@@ -50,22 +48,36 @@ func (lb *LoadBalancer) AddBackend(path string, rawurl string, weight int) {
 	lb.Groups[path] = append(lb.Groups[path], &Backend{URL: u, Weight: weight})
 }
 
-func (lb *LoadBalancer) getNextBackendDRR(backends []*Backend) *Backend {
-	for {
-		for _, b := range backends {
-			b.Mutex.Lock()
-			b.Current += lb.Quantum
-			if b.Current >= 1 {
-				b.Current--
-				b.Mutex.Unlock()
-				return b
-			}
-			b.Mutex.Unlock()
-		}
+func estimateRequestCost(r *http.Request) float64 {
+	cost := float64(len(r.URL.Path))
+	if r.ContentLength > 0 {
+		cost += float64(r.ContentLength)
 	}
+	return math.Max(cost/100.0, 1.0) // Normalize cost to a base scale
 }
 
-func (lb *LoadBalancer) getNextBackendWFQ(backends []*Backend) *Backend {
+func (lb *LoadBalancer) getNextBackendDRR(backends []*Backend, path string, cost float64) *Backend {
+	n := len(backends)
+	start := lb.lastUsed[path]
+
+	for i := 0; i < n; i++ {
+		index := (start + i) % n
+		b := backends[index]
+		b.Mutex.Lock()
+		b.Deficit += lb.Quantum
+		if b.Deficit >= cost {
+			b.Deficit -= cost
+			lb.lastUsed[path] = (index + 1) % n
+			b.Mutex.Unlock()
+			return b
+		}
+		b.Mutex.Unlock()
+	}
+
+	return backends[start]
+}
+
+func (lb *LoadBalancer) getNextBackendWFQ(backends []*Backend, cost float64) *Backend {
 	now := float64(time.Now().UnixNano()) / 1e9
 	minFinish := math.MaxFloat64
 	var selected *Backend
@@ -73,7 +85,7 @@ func (lb *LoadBalancer) getNextBackendWFQ(backends []*Backend) *Backend {
 	for _, b := range backends {
 		b.Mutex.Lock()
 		arrival := now
-		finish := math.Max(arrival, b.FinishTime) + 1.0/float64(b.Weight)
+		finish := math.Max(arrival, b.FinishTime) + cost/float64(b.Weight)
 		if finish < minFinish {
 			selected = b
 			minFinish = finish
@@ -114,12 +126,13 @@ func (lb *LoadBalancer) forward(path string) http.HandlerFunc {
 			return
 		}
 
+		cost := estimateRequestCost(r)
 		var backend *Backend
 		switch lb.Algorithm {
 		case "DRR":
-			backend = lb.getNextBackendDRR(backends)
+			backend = lb.getNextBackendDRR(backends, path, cost)
 		case "WFQ":
-			backend = lb.getNextBackendWFQ(backends)
+			backend = lb.getNextBackendWFQ(backends, cost)
 		case "LC":
 			backend = lb.getNextBackendLC(backends)
 		default:
@@ -133,7 +146,12 @@ func (lb *LoadBalancer) forward(path string) http.HandlerFunc {
 			trimmedPath = "/" + trimmedPath
 		}
 		proxyURL.Path = trimmedPath
-		proxyReq, err := http.NewRequest(r.Method, proxyURL.String(), r.Body)
+
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		r = r.WithContext(ctx)
+		defer cancel()
+
+		proxyReq, err := http.NewRequestWithContext(ctx, r.Method, proxyURL.String(), r.Body)
 		if err != nil {
 			http.Error(w, "Bad request", http.StatusBadRequest)
 			return
@@ -148,6 +166,11 @@ func (lb *LoadBalancer) forward(path string) http.HandlerFunc {
 		resp, err := client.Do(proxyReq)
 		if err != nil {
 			http.Error(w, "Bad gateway", http.StatusBadGateway)
+			if lb.Algorithm == "LC" {
+				backend.Mutex.Lock()
+				backend.ActiveConn--
+				backend.Mutex.Unlock()
+			}
 			return
 		}
 		defer resp.Body.Close()
@@ -169,7 +192,7 @@ func (lb *LoadBalancer) forward(path string) http.HandlerFunc {
 func main() {
 	rand.Seed(time.Now().UnixNano())
   port := "9010"
-  algorithm := "LC" // Change to "DRR", "WFQ", or "LC"
+  algorithm := "WFQ" // Change to "DRR", "WFQ", or "LC"
 
 	lb := NewLoadBalancer(algorithm, 1)
 

@@ -133,14 +133,17 @@ func (lb *LoadBalancer) forward(path string) http.HandlerFunc {
 			trimmedPath = "/" + trimmedPath
 		}
 		proxyURL.Path = trimmedPath
-
 		proxyReq, err := http.NewRequest(r.Method, proxyURL.String(), r.Body)
 		if err != nil {
 			http.Error(w, "Bad request", http.StatusBadRequest)
 			return
 		}
 
-		proxyReq.Header = r.Header
+		proxyReq.Header = make(http.Header)
+		for k, v := range r.Header {
+			proxyReq.Header[k] = v
+		}
+
 		client := &http.Client{}
 		resp, err := client.Do(proxyReq)
 		if err != nil {
@@ -165,10 +168,12 @@ func (lb *LoadBalancer) forward(path string) http.HandlerFunc {
 
 func main() {
 	rand.Seed(time.Now().UnixNano())
-	lb := NewLoadBalancer("LC", 1) // Change to "DRR", "WFQ", or "LC"
+  port := "9010"
+  algorithm := "LC" // Change to "DRR", "WFQ", or "LC"
+
+	lb := NewLoadBalancer(algorithm, 1)
 
   lb.AddBackend("/api", "https://singidunum.ac.rs", 1)
-
 	lb.AddBackend("/test", "https://mage.singidunum.ac.rs", 1)
 
 	http.HandleFunc("/api", lb.forward("/api"))
@@ -176,6 +181,6 @@ func main() {
 	http.HandleFunc("/test", lb.forward("/test"))
 	http.HandleFunc("/test/", lb.forward("/test"))
 
-	fmt.Println("Load balancer listening on :9010")
-	http.ListenAndServe(":9010", nil)
+  fmt.Printf("Load balancer listening on 0.0.0.0:%s\n", port)
+	http.ListenAndServe("0.0.0.0:"+port, nil)
 }
